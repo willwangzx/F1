@@ -1,0 +1,19 @@
+project:
+  name: f1-recognition
+  raw_images_dir: D:/Arc/F1
+  notes: >
+    This file stores default training knobs only. Dataset locations are still
+    provided on the command line so the project is easy to move between machines.
+
+classifier:
+  backbone: resnet50
+  heads: [team, car_model]
+  epochs: 24
+  batch_size: 16
+  lr: 0.0001
+  weight_decay: 0.0001
+  image_size: 384
+  dropout: 0.2
+  num_workers: 4
+  early_stop_score: 1.0
+  early_stop_patience: 3

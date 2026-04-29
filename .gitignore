@@ -1,0 +1,61 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local Python environments
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+
+# Editor and OS local files
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Project data: raw images, private labels, and generated datasets
+F1/
+data/
+dataset/
+datasets/
+annotations/
+*.csv
+!templates/*.csv
+
+# Training, evaluation, and prediction outputs
+outputs/
+runs/
+results/
+wandb/
+mlruns/
+logs/
+*.log
+
+# Model weights and exported binaries
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+*.ckpt
+*.safetensors
+*.pkl
+*.joblib
+!models/README.md
+
+# Local-only config copies
+configs/*.yaml
+configs/*.yml
+!configs/*.example.yaml
+!configs/*.example.yml
