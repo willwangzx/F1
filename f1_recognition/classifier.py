@@ -19,8 +19,35 @@ LABEL_NAME_KEYS = {
 }
 
 
+class YoloClassifyFeatures(nn.Module):
+    def __init__(self, classify_head: nn.Module) -> None:
+        super().__init__()
+        self.conv = classify_head.conv
+        self.pool = classify_head.pool
+        self.drop = classify_head.drop
+        self.feature_dim = classify_head.linear.in_features
+
+    def forward(self, x: list[torch.Tensor] | torch.Tensor) -> torch.Tensor:
+        if isinstance(x, list):
+            x = torch.cat(x, 1)
+        return self.drop(self.pool(self.conv(x)).flatten(1))
+
+
+def build_yolo_classification_backbone(backbone_name: str, pretrained: bool = True) -> tuple[nn.Module, int]:
+    from ultralytics import YOLO
+
+    model_ref = f"{backbone_name}.pt" if pretrained else f"{backbone_name}.yaml"
+    yolo_model = YOLO(model_ref).model
+    modules = list(yolo_model.model)
+    feature_head = YoloClassifyFeatures(modules[-1])
+    modules[-1] = feature_head
+    return nn.Sequential(*modules), feature_head.feature_dim
+
+
 def build_backbone(backbone_name: str, pretrained: bool = True) -> tuple[nn.Module, int]:
     backbone_name = backbone_name.lower()
+    if backbone_name in {"yolo26n-cls", "yolo26s-cls", "yolo26m-cls", "yolo26l-cls", "yolo26x-cls"}:
+        return build_yolo_classification_backbone(backbone_name, pretrained=pretrained)
     if backbone_name == "resnet18":
         weights = models.ResNet18_Weights.DEFAULT if pretrained else None
         backbone = models.resnet18(weights=weights)
@@ -32,6 +59,30 @@ def build_backbone(backbone_name: str, pretrained: bool = True) -> tuple[nn.Modu
         backbone = models.resnet50(weights=weights)
         feature_dim = backbone.fc.in_features
         backbone.fc = nn.Identity()
+        return backbone, feature_dim
+    if backbone_name == "resnet101":
+        weights = models.ResNet101_Weights.DEFAULT if pretrained else None
+        backbone = models.resnet101(weights=weights)
+        feature_dim = backbone.fc.in_features
+        backbone.fc = nn.Identity()
+        return backbone, feature_dim
+    if backbone_name == "efficientnet_b0":
+        weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+        backbone = models.efficientnet_b0(weights=weights)
+        feature_dim = backbone.classifier[1].in_features
+        backbone.classifier = nn.Identity()
+        return backbone, feature_dim
+    if backbone_name == "efficientnet_b3":
+        weights = models.EfficientNet_B3_Weights.DEFAULT if pretrained else None
+        backbone = models.efficientnet_b3(weights=weights)
+        feature_dim = backbone.classifier[1].in_features
+        backbone.classifier = nn.Identity()
+        return backbone, feature_dim
+    if backbone_name == "convnext_tiny":
+        weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+        backbone = models.convnext_tiny(weights=weights)
+        feature_dim = backbone.classifier[2].in_features
+        backbone.classifier[2] = nn.Identity()
         return backbone, feature_dim
     raise ValueError(f"Unsupported backbone: {backbone_name}")
 
@@ -76,32 +127,63 @@ class CropClassificationDataset(Dataset):
         split: str,
         transform: transforms.Compose,
         cache_mode: str = "none",
+        shard_dir: Path | None = None,
     ) -> None:
+        self.split = split
         self.rows = [row for row in read_csv(manifest_path) if row["split"] == split]
         if not self.rows:
             raise ValueError(f"No rows with split={split} found in {manifest_path}")
         self.transform = transform
         self.cache_mode = cache_mode
-        if cache_mode not in {"none", "ram"}:
+        if cache_mode not in {"none", "ram", "val_tensors", "shard"}:
             raise ValueError(f"Unsupported cache_mode={cache_mode!r}")
         self.cached_images: list[Image.Image] | None = None
+        self.cached_tensors: dict[int, torch.Tensor] | None = None
+        self.shard_tensors: torch.Tensor | None = None
         if cache_mode == "ram":
             self.cached_images = []
             for row in self.rows:
                 with Image.open(row["crop_path"]) as image_file:
                     self.cached_images.append(image_file.convert("RGB"))
+        elif cache_mode == "val_tensors":
+            self.cached_tensors = {}
+        elif cache_mode == "shard":
+            self._load_shard(shard_dir)
+
+    def _load_shard(self, shard_dir: Path | None) -> None:
+        if shard_dir is None:
+            raise ValueError("shard_dir must be provided when cache_mode='shard'")
+        shard_path = Path(shard_dir) / f"shard_{self.split}.pt"
+        if not shard_path.exists():
+            raise FileNotFoundError(f"Shard not found: {shard_path}")
+        shard = torch.load(shard_path, map_location="cpu", weights_only=False)
+        self.shard_tensors = shard["images"].contiguous()
+        if "rows" in shard:
+            self.rows = shard["rows"]
+        if len(self.rows) != len(self.shard_tensors):
+            raise ValueError(
+                f"Shard row count mismatch for {shard_path}: "
+                f"{len(self.rows)} rows vs {len(self.shard_tensors)} tensors"
+            )
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, index: int) -> dict:
         row = self.rows[index]
-        if self.cached_images is not None:
+        if self.cached_tensors is not None and index in self.cached_tensors:
+            image_tensor = self.cached_tensors[index]
+        elif self.shard_tensors is not None:
+            image_tensor = self.shard_tensors[index]
+        elif self.cached_images is not None:
             image = self.cached_images[index].copy()
+            image_tensor = self.transform(image)
         else:
             with Image.open(row["crop_path"]) as image_file:
                 image = image_file.convert("RGB")
-        image_tensor = self.transform(image)
+            image_tensor = self.transform(image)
+        if self.cached_tensors is not None and index not in self.cached_tensors:
+            self.cached_tensors[index] = image_tensor
         return {
             "image": image_tensor,
             "team_target": int(row["team_id"]),
