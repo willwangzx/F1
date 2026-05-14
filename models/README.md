@@ -1,5 +1,5 @@
 # Preserved Models
 
-- `best_classifier.pt`: copied from `outputs/training/classifier_merged_cached/best_classifier.pt`; merged dataset classifier, best_score 0.968421.
-- `best_detector.pt`: copied from `outputs/training/detector/f1_car_detector_trainall_randomval_1920/weights/best.pt`; final merged/train-all detector, validation mAP50 0.896390, mAP50-95 0.453930.
+- `best_classifier.pt`: ConvNeXt-Tiny classifier trained from normalized CVAT annotations; heads `team` and `car_model`; best validation score 0.978947.
+- `best_detector.pt`: YOLO26s detector fine-tuned from `yolo26s.pt` at imgsz 1920, batch 4, with train-only hflip/brightness/contrast augmentation; validation mAP50 0.965000, mAP50-95 0.873613.
 - `best_detector_legacy_high_map.pt`: copied from `outputs/training/detector/f1_car_detector-2/weights/best.pt`; older smaller validation split, mAP50 0.995000, mAP50-95 0.900360.
