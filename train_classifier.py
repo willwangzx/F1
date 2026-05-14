@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import time
-from pathlib import Path
+from collections import Counter
 from collections.abc import Iterator
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -46,12 +48,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--early-stop-score", type=float, default=None)
     parser.add_argument("--early-stop-patience", type=int, default=None)
+    parser.add_argument(
+        "--early-stop-no-improve-patience",
+        type=int,
+        default=None,
+        help="Stop when validation score has not improved for this many epochs. Disabled by default.",
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum score gain counted as an improvement for no-improve early stopping.",
+    )
     parser.add_argument("--no-channels-last", action="store_true", help="Disable channels-last tensors on CUDA.")
     parser.add_argument(
         "--cache-mode",
-        choices=("none", "ram"),
+        choices=("none", "ram", "shard"),
         default="none",
-        help="Preload decoded classifier crops into RAM to avoid per-epoch JPEG decode.",
+        help="How to load training crops. Use 'ram' for decoded PIL cache or 'shard' with --shard-dir.",
     )
     parser.add_argument("--compile", action="store_true", help="Compile the classifier model with torch.compile.")
     parser.add_argument(
@@ -79,6 +93,79 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Classifier heads to train/evaluate. Use '--heads team car_model' to skip driver training for the first pass.",
     )
+    parser.add_argument(
+        "--keep-best-only",
+        action="store_true",
+        help="After training, remove non-checkpoint artifacts from the output directory.",
+    )
+    parser.add_argument(
+        "--val-every",
+        type=int,
+        default=None,
+        help="Run validation every N epochs (default: 1 = every epoch).",
+    )
+    parser.add_argument(
+        "--quick-val-ratio",
+        type=float,
+        default=None,
+        help="Use a random subset of val data for quicker validation (e.g. 0.25 = 25%%). "
+             "Full validation runs on the best-score epoch.",
+    )
+    parser.add_argument(
+        "--val-cache-mode",
+        choices=("none", "ram", "val_tensors", "shard"),
+        default=None,
+        help="How to cache validation tensors. 'val_tensors' caches transformed tensors "
+             "after first epoch to skip repeated Resize/ToTensor/Normalize. "
+             "(default: falls back to --cache-mode).",
+    )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=None,
+        help="Accumulate gradients over this many micro-batches before each optimizer step. "
+             "Effective batch size = batch_size * grad_accum_steps.",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Freeze backbone parameters at the start of training.",
+    )
+    parser.add_argument(
+        "--freeze-backbone-epochs",
+        type=int,
+        default=None,
+        help="Number of epochs to keep the backbone frozen before unfreezing. "
+             "0 = freeze forever (when --freeze-backbone is set).",
+    )
+    parser.add_argument(
+        "--balanced-head",
+        nargs="+",
+        choices=CLASSIFIER_HEADS,
+        default=None,
+        help="Class-balance training sampling by one or more heads. "
+             "When multiple heads are given, weights are averaged.",
+    )
+    parser.add_argument(
+        "--auto-batch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Auto-detect the largest safe batch size using a memory probe before training.",
+    )
+    parser.add_argument(
+        "--auto-batch-min",
+        type=int,
+        default=None,
+        help="Minimum batch size to try during auto-batch search (default: 1).",
+    )
+    parser.add_argument(
+        "--shard-dir",
+        type=Path,
+        default=None,
+        help="Path to preprocessed tensor shards directory. When set, classifier crops "
+             "are loaded from .pt shards instead of individual JPEG files.",
+    )
     return parser
 
 
@@ -93,7 +180,38 @@ def collate(batch: list[dict]) -> dict:
     }
 
 
-def evaluate(
+def evaluate_metrics(
+    model: MultiHeadClassifier,
+    dataloader: DataLoader,
+    device: torch.device,
+    active_heads: list[str],
+    channels_last: bool,
+    cuda_prefetch: bool,
+) -> dict:
+    """Return per-head accuracy + joint accuracy. No per-row predictions."""
+    model.eval()
+    total = 0
+    correct = {head: 0 for head in active_heads}
+    joint_correct = 0
+    with torch.inference_mode():
+        for batch in iterate_batches(dataloader, device=device, channels_last=channels_last, cuda_prefetch=cuda_prefetch):
+            images = batch["images"]
+            outputs = model(images, heads=active_heads)
+            total += images.shape[0]
+            all_correct = torch.ones(images.shape[0], dtype=torch.bool, device=device)
+            for head in active_heads:
+                preds = outputs[head].argmax(dim=1)
+                targets = batch[TARGET_KEYS[head]]
+                head_correct = preds == targets
+                correct[head] += head_correct.sum().item()
+                all_correct &= head_correct
+            joint_correct += all_correct.sum().item()
+    metrics = {f"{head}_accuracy": (correct[head] / total if total else 0.0) for head in correct}
+    metrics["joint_accuracy"] = joint_correct / total if total else 0.0
+    return metrics
+
+
+def evaluate_full(
     model: MultiHeadClassifier,
     dataloader: DataLoader,
     device: torch.device,
@@ -102,6 +220,7 @@ def evaluate(
     channels_last: bool,
     cuda_prefetch: bool,
 ) -> tuple[dict, list[dict]]:
+    """Return metrics + full per-row predictions for CSV export."""
     model.eval()
     total = 0
     correct = {head: 0 for head in active_heads}
@@ -143,18 +262,48 @@ def build_loader(
     pin_memory: bool,
     prefetch_factor: int | None,
     persistent_workers: bool,
+    sampler=None,
 ) -> DataLoader:
     kwargs = {
         "batch_size": batch_size,
-        "shuffle": shuffle,
+        "shuffle": shuffle if sampler is None else False,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
         "collate_fn": collate,
     }
+    if sampler is not None:
+        kwargs["sampler"] = sampler
     if num_workers > 0:
         kwargs["persistent_workers"] = persistent_workers
         kwargs["prefetch_factor"] = prefetch_factor or 2
     return DataLoader(dataset, **kwargs)
+
+
+def build_balanced_sampler(
+    manifest_path: Path,
+    split: str,
+    heads: list[str],
+) -> torch.utils.data.WeightedRandomSampler:
+    """Build a WeightedRandomSampler that class-balances across the given heads."""
+    from torch.utils.data import WeightedRandomSampler
+
+    head_to_target_key = {"team": "team_id", "driver": "driver_id", "car_model": "car_model_id"}
+    from f1_recognition.io_utils import read_csv
+    rows = [row for row in read_csv(manifest_path) if row["split"] == split]
+    if not rows:
+        raise ValueError(f"No rows with split={split} found in {manifest_path}")
+
+    n = len(rows)
+    per_head_weights = []
+    for head in heads:
+        key = head_to_target_key[head]
+        class_ids = [int(row[key]) for row in rows]
+        class_counts = Counter(class_ids)
+        weights = torch.tensor([1.0 / class_counts[cid] for cid in class_ids], dtype=torch.double)
+        per_head_weights.append(weights)
+
+    sample_weights = per_head_weights[0] if len(per_head_weights) == 1 else torch.stack(per_head_weights).mean(dim=0)
+    return WeightedRandomSampler(weights=sample_weights, num_samples=n, replacement=True)
 
 
 def move_batch_to_device(batch: dict, device: torch.device, channels_last: bool) -> dict:
@@ -208,6 +357,110 @@ def iterate_batches(
         yield batch
 
 
+def cleanup_training_artifacts(output_dir: Path, best_checkpoint: Path) -> None:
+    for path in output_dir.iterdir():
+        if path.resolve() == best_checkpoint.resolve():
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
+def probe_max_batch_size(
+    backbone_name: str,
+    num_team_classes: int,
+    num_driver_classes: int,
+    num_car_model_classes: int,
+    dropout: float,
+    device: torch.device,
+    image_size: int,
+    target_batch: int,
+    min_batch: int,
+    active_heads: list[str],
+    channels_last: bool,
+) -> int:
+    """Binary-search for the largest safe batch size using a forward+backward probe."""
+    import math
+
+    criterion = nn.CrossEntropyLoss()
+
+    def try_batch(batch: int) -> bool:
+        try:
+            probe = MultiHeadClassifier(
+                backbone_name=backbone_name,
+                num_team_classes=num_team_classes,
+                num_driver_classes=num_driver_classes,
+                num_car_model_classes=num_car_model_classes,
+                pretrained=False,
+                dropout=dropout,
+            ).to(device)
+            if channels_last:
+                probe = probe.to(memory_format=torch.channels_last)
+            probe.train()
+            probe_scaler = torch.amp.GradScaler("cuda", enabled=True)
+            probe_optimizer = AdamW(probe.parameters(), lr=1e-6)
+            dummy_images = torch.randn(batch, 3, image_size, image_size, device=device)
+            if channels_last:
+                dummy_images = dummy_images.contiguous(memory_format=torch.channels_last)
+            class_counts = {
+                "team": num_team_classes,
+                "driver": num_driver_classes,
+                "car_model": num_car_model_classes,
+            }
+            dummy_targets = {
+                head: torch.randint(0, class_counts[head], (batch,), device=device)
+                for head in active_heads
+            }
+            probe_optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, enabled=True):
+                outputs = probe(dummy_images, heads=active_heads)
+                loss = sum(criterion(outputs[head], dummy_targets[head]) for head in active_heads) / len(active_heads)
+            probe_scaler.scale(loss).backward()
+            probe_scaler.step(probe_optimizer)
+            probe_scaler.update()
+            del probe, dummy_images, dummy_targets, outputs, loss
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+            return True
+        except RuntimeError as exc:
+            torch.cuda.empty_cache()
+            if "out of memory" in str(exc).lower():
+                return False
+            raise
+
+    if try_batch(target_batch):
+        print(f"Auto-batch: target batch {target_batch} fits.")
+        return target_batch
+
+    print(f"Auto-batch: target batch {target_batch} OOM, searching...")
+    lo, hi = min_batch, target_batch
+    best = min_batch
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if try_batch(mid):
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    print(f"Auto-batch: found batch size {best}.")
+    return best
+
+
+def freeze_backbone_params(model: MultiHeadClassifier, exclude_substrings: list[str] | None = None) -> None:
+    """Freeze backbone parameters, optionally excluding those with given substrings."""
+    for name, param in model.backbone.named_parameters():
+        if exclude_substrings and any(ex in name for ex in exclude_substrings):
+            continue
+        param.requires_grad = False
+
+
+def unfreeze_backbone_params(model: MultiHeadClassifier) -> None:
+    """Unfreeze all backbone parameters."""
+    for param in model.backbone.parameters():
+        param.requires_grad = True
+
+
 def main() -> None:
     args = build_parser().parse_args()
     config = load_yaml(args.config)
@@ -232,7 +485,31 @@ def main() -> None:
         if args.early_stop_patience is not None
         else int(train_cfg.get("early_stop_patience", 0))
     )
+    early_stop_no_improve_patience = (
+        args.early_stop_no_improve_patience
+        if args.early_stop_no_improve_patience is not None
+        else int(train_cfg.get("early_stop_no_improve_patience", 0))
+    )
     active_heads = list(dict.fromkeys(args.heads or train_cfg.get("heads", list(CLASSIFIER_HEADS))))
+    val_every = args.val_every or int(train_cfg.get("val_every", 1))
+    quick_val_ratio = args.quick_val_ratio if args.quick_val_ratio is not None else train_cfg.get("quick_val_ratio", None)
+    configured_val_cache_mode = args.val_cache_mode if args.val_cache_mode is not None else train_cfg.get("val_cache_mode", None)
+    val_cache_mode = configured_val_cache_mode or (args.cache_mode if args.cache_mode == "ram" else "none")
+    grad_accum_steps = args.grad_accum_steps or int(train_cfg.get("grad_accum_steps", 1))
+    freeze_backbone = args.freeze_backbone if args.freeze_backbone is not None else bool(train_cfg.get("freeze_backbone", False))
+    freeze_backbone_epochs = args.freeze_backbone_epochs if args.freeze_backbone_epochs is not None else int(train_cfg.get("freeze_backbone_epochs", 0))
+    balanced_heads = list(dict.fromkeys(args.balanced_head or train_cfg.get("balanced_head", None) or []))
+    auto_batch = args.auto_batch if args.auto_batch is not None else bool(train_cfg.get("auto_batch", False))
+    auto_batch_min = args.auto_batch_min or int(train_cfg.get("auto_batch_min", 1))
+    shard_dir = args.shard_dir or (Path(train_cfg["shard_dir"]) if train_cfg.get("shard_dir") else None)
+    train_cache_mode = "shard" if shard_dir is not None else args.cache_mode
+    val_cache_mode = "shard" if shard_dir is not None else val_cache_mode
+    if val_every < 1:
+        raise ValueError("--val-every must be >= 1")
+    if grad_accum_steps < 1:
+        raise ValueError("--grad-accum-steps must be >= 1")
+    if quick_val_ratio is not None and not (0 < float(quick_val_ratio) <= 1):
+        raise ValueError("--quick-val-ratio must be in the range (0, 1]")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -248,17 +525,20 @@ def main() -> None:
         args.manifest,
         split="train",
         transform=train_tfms,
-        cache_mode=args.cache_mode,
+        cache_mode=train_cache_mode,
+        shard_dir=shard_dir,
     )
     val_dataset = CropClassificationDataset(
         args.manifest,
         split="val",
         transform=eval_tfms,
-        cache_mode=args.cache_mode,
+        cache_mode=val_cache_mode,
+        shard_dir=shard_dir,
     )
     device = torch.device(args.device)
     pin_memory = device.type == "cuda"
     channels_last = device.type == "cuda" and not args.no_channels_last
+    train_sampler = build_balanced_sampler(args.manifest, "train", balanced_heads) if balanced_heads else None
     train_loader = build_loader(
         train_dataset,
         batch_size=batch_size,
@@ -267,6 +547,7 @@ def main() -> None:
         pin_memory=pin_memory,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
+        sampler=train_sampler,
     )
     val_loader = build_loader(
         val_dataset,
@@ -291,93 +572,209 @@ def main() -> None:
     if args.compile:
         model = torch.compile(model)
 
+    if auto_batch and device.type == "cuda":
+        detected = probe_max_batch_size(
+            backbone_name=backbone,
+            num_team_classes=len(label_maps["team_names"]),
+            num_driver_classes=len(label_maps["driver_names"]),
+            num_car_model_classes=len(label_maps["car_model_names"]),
+            dropout=float(train_cfg.get("dropout", 0.2)),
+            device=device,
+            image_size=image_size,
+            target_batch=batch_size,
+            min_batch=auto_batch_min,
+            active_heads=active_heads,
+            channels_last=channels_last,
+        )
+        if detected != batch_size:
+            batch_size = detected
+            print(f"Auto-batch: training with adjusted batch size {batch_size}.")
+            train_loader = build_loader(
+                train_dataset, batch_size=batch_size, shuffle=True,
+                num_workers=num_workers, pin_memory=pin_memory,
+                prefetch_factor=args.prefetch_factor, persistent_workers=args.persistent_workers,
+                sampler=train_sampler,
+            )
+            val_loader = build_loader(
+                val_dataset, batch_size=batch_size, shuffle=False,
+                num_workers=num_workers, pin_memory=pin_memory,
+                prefetch_factor=args.prefetch_factor, persistent_workers=args.persistent_workers,
+            )
+
+    if freeze_backbone:
+        freeze_backbone_params(model)
+        frozen_count = sum(1 for p in model.backbone.parameters() if not p.requires_grad)
+        total_backbone = sum(1 for _ in model.backbone.parameters())
+        print(f"Frozen {frozen_count}/{total_backbone} backbone parameters.")
+
     criterion = nn.CrossEntropyLoss()
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs))
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     output_dir = ensure_dir(args.output_dir.resolve())
     best_metric = -1.0
     best_epoch = 0
+    stale_epochs = 0
     target_score_epochs = 0
     history: list[dict] = []
     started = time.time()
 
     for epoch in range(1, epochs + 1):
+        epoch_start = time.perf_counter()
         model.train()
         running_loss = 0.0
+        num_batches = 0
+        data_load_time = 0.0
+        batch_start = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
         for batch in iterate_batches(
             train_loader,
             device=device,
             channels_last=channels_last,
             cuda_prefetch=args.cuda_prefetch,
         ):
+            if num_batches == 0:
+                data_load_time = time.perf_counter() - batch_start
             images = batch["images"]
             targets = {
                 "team": batch["team_target"],
                 "driver": batch["driver_target"],
                 "car_model": batch["car_model_target"],
             }
-            optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
                 outputs = model(images, heads=active_heads)
-                loss = sum(criterion(outputs[head], targets[head]) for head in active_heads) / len(active_heads)
+                micro_loss = sum(criterion(outputs[head], targets[head]) for head in active_heads) / len(active_heads)
+                loss = micro_loss / grad_accum_steps
             scaler.scale(loss).backward()
+            if (num_batches + 1) % grad_accum_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            running_loss += micro_loss.item() * images.size(0)
+            num_batches += 1
+        if num_batches % grad_accum_steps != 0:
             scaler.step(optimizer)
             scaler.update()
-            running_loss += loss.item() * images.size(0)
+            optimizer.zero_grad(set_to_none=True)
+        train_end = time.perf_counter()
         scheduler.step()
+        if freeze_backbone and freeze_backbone_epochs > 0 and epoch == freeze_backbone_epochs:
+            unfreeze_backbone_params(model)
+            optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
+            scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs - epoch))
+            scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+            print(f"Unfrozen backbone at epoch {epoch} after training. Optimizer and scheduler rebuilt.")
 
         train_loss = running_loss / len(train_dataset)
-        metrics, eval_rows = evaluate(
-            model,
-            val_loader,
-            device=device,
-            label_maps=label_maps,
-            active_heads=active_heads,
-            channels_last=channels_last,
-            cuda_prefetch=args.cuda_prefetch,
-        )
+        val_start = time.perf_counter()
+        do_val = (epoch % val_every == 0) or (epoch == epochs)
+        if do_val:
+            if quick_val_ratio is not None and quick_val_ratio < 1.0:
+                from torch.utils.data import Subset
+                n_total = len(val_dataset)
+                n_subset = max(1, int(round(n_total * quick_val_ratio)))
+                rng = torch.Generator().manual_seed(args.seed + epoch)
+                subset_indices = torch.randperm(n_total, generator=rng)[:n_subset].tolist()
+                val_subset = Subset(val_dataset, subset_indices)
+                val_subset_loader = build_loader(
+                    val_subset, batch_size=batch_size, shuffle=False,
+                    num_workers=num_workers, pin_memory=pin_memory,
+                    prefetch_factor=args.prefetch_factor, persistent_workers=args.persistent_workers,
+                )
+                metrics = evaluate_metrics(
+                    model, val_subset_loader, device=device,
+                    active_heads=active_heads, channels_last=channels_last, cuda_prefetch=args.cuda_prefetch,
+                )
+            else:
+                metrics = evaluate_metrics(
+                    model, val_loader, device=device,
+                    active_heads=active_heads, channels_last=channels_last, cuda_prefetch=args.cuda_prefetch,
+                )
+        else:
+            if history:
+                metrics = {k: v for k, v in history[-1].items() if k in [f"{h}_accuracy" for h in active_heads] + ["joint_accuracy"]}
+            else:
+                metrics = {f"{h}_accuracy": 0.0 for h in active_heads}
+                metrics["joint_accuracy"] = 0.0
+        previous_best_metric = best_metric
+        model_score = sum(metrics[f"{head}_accuracy"] for head in active_heads) / len(active_heads)
+        val_end = time.perf_counter()
+        ckpt_time = 0.0
+        if do_val and model_score > best_metric:
+            full_metrics, eval_rows = evaluate_full(
+                model,
+                val_loader,
+                device=device,
+                label_maps=label_maps,
+                active_heads=active_heads,
+                channels_last=channels_last,
+                cuda_prefetch=args.cuda_prefetch,
+            )
+            metrics = full_metrics
+            model_score = sum(metrics[f"{head}_accuracy"] for head in active_heads) / len(active_heads)
+            if model_score > best_metric:
+                best_metric = model_score
+                best_epoch = epoch
+                ckpt_start = time.perf_counter()
+                checkpoint = {
+                    "model_state": (model._orig_mod if hasattr(model, "_orig_mod") else model).state_dict(),
+                    "backbone": backbone,
+                    "label_maps": label_maps,
+                    "image_size": image_size,
+                    "heads": active_heads,
+                    "metrics": metrics,
+                    "epoch": epoch,
+                    "dropout": float(train_cfg.get("dropout", 0.2)),
+                }
+                torch.save(checkpoint, output_dir / "best_classifier.pt")
+                eval_fieldnames = ["crop_path", "image_name", "source"]
+                for head in active_heads:
+                    eval_fieldnames.extend([f"{head}_true", f"{head}_pred"])
+                eval_fieldnames.append("tcam_visible")
+                write_csv(
+                    output_dir / "eval_classifier.csv",
+                    eval_rows,
+                    eval_fieldnames,
+                )
+                ckpt_time = time.perf_counter() - ckpt_start
+        improved_for_stop = model_score > previous_best_metric + args.early_stop_min_delta
+        epoch_time = time.perf_counter() - epoch_start
+        timing = {
+            "first_batch_latency": round(data_load_time, 3),
+            "train_seconds": round(train_end - epoch_start, 3),
+            "val_seconds": round(val_end - train_end, 3),
+            "checkpoint_seconds": round(ckpt_time, 3),
+            "epoch_seconds": round(epoch_time, 3),
+        }
         epoch_summary = {
             "epoch": epoch,
             "train_loss": train_loss,
             **metrics,
             "lr": scheduler.get_last_lr()[0],
+            **timing,
         }
         history.append(epoch_summary)
         head_metrics = " ".join(f"{head}={metrics[f'{head}_accuracy']:.3f}" for head in active_heads)
-        print(f"Epoch {epoch:03d}: loss={train_loss:.4f} {head_metrics} joint={metrics['joint_accuracy']:.3f}")
-
-        model_score = sum(metrics[f"{head}_accuracy"] for head in active_heads) / len(active_heads)
-        if model_score > best_metric:
-            best_metric = model_score
-            best_epoch = epoch
-            checkpoint = {
-                "model_state": (model._orig_mod if hasattr(model, "_orig_mod") else model).state_dict(),
-                "backbone": backbone,
-                "label_maps": label_maps,
-                "image_size": image_size,
-                "heads": active_heads,
-                "metrics": metrics,
-                "epoch": epoch,
-                "dropout": float(train_cfg.get("dropout", 0.2)),
-            }
-            torch.save(checkpoint, output_dir / "best_classifier.pt")
-            eval_fieldnames = ["crop_path", "image_name", "source"]
-            for head in active_heads:
-                eval_fieldnames.extend([f"{head}_true", f"{head}_pred"])
-            eval_fieldnames.append("tcam_visible")
-            write_csv(
-                output_dir / "eval_classifier.csv",
-                eval_rows,
-                eval_fieldnames,
-            )
-        if early_stop_score is not None and early_stop_patience > 0:
-            target_score_epochs = target_score_epochs + 1 if model_score >= early_stop_score else 0
-            if target_score_epochs >= early_stop_patience:
+        print(f"Epoch {epoch:03d}: loss={train_loss:.4f} {head_metrics} joint={metrics['joint_accuracy']:.3f} "
+              f"train={timing['train_seconds']:.1f}s val={timing['val_seconds']:.1f}s")
+        if do_val:
+            if improved_for_stop:
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            if early_stop_score is not None and early_stop_patience > 0:
+                target_score_epochs = target_score_epochs + 1 if model_score >= early_stop_score else 0
+                if target_score_epochs >= early_stop_patience:
+                    print(
+                        f"Early stopping after {epoch} epochs: score {model_score:.3f} "
+                        f"met target {early_stop_score:.3f} for {early_stop_patience} epochs."
+                    )
+                    break
+            if early_stop_no_improve_patience > 0 and stale_epochs >= early_stop_no_improve_patience:
                 print(
-                    f"Early stopping after {epoch} epochs: score {model_score:.3f} "
-                    f"met target {early_stop_score:.3f} for {early_stop_patience} epochs."
+                    f"Early stopping after {epoch} epochs: score did not improve by "
+                    f"{args.early_stop_min_delta:.6f} for {early_stop_no_improve_patience} epochs."
                 )
                 break
 
@@ -397,17 +794,31 @@ def main() -> None:
             "num_workers": num_workers,
             "device": str(device),
             "channels_last": channels_last,
-            "cache_mode": args.cache_mode,
+            "cache_mode": train_cache_mode,
             "compile": args.compile,
             "cuda_prefetch": args.cuda_prefetch,
             "prefetch_factor": args.prefetch_factor or (2 if num_workers > 0 else None),
             "persistent_workers": args.persistent_workers if num_workers > 0 else False,
             "seed": args.seed,
             "best_epoch": best_epoch,
+            "early_stop_no_improve_patience": early_stop_no_improve_patience,
+            "early_stop_min_delta": args.early_stop_min_delta,
+            "val_every": val_every,
+            "quick_val_ratio": quick_val_ratio,
+            "val_cache_mode": val_cache_mode,
+            "grad_accum_steps": grad_accum_steps,
+            "freeze_backbone": freeze_backbone,
+            "freeze_backbone_epochs": freeze_backbone_epochs,
+            "balanced_heads": balanced_heads,
+            "auto_batch": auto_batch,
+            "auto_batch_min": auto_batch_min,
+            "shard_dir": str(shard_dir) if shard_dir else None,
             "duration_seconds": round(time.time() - started, 2),
             "best_score": best_metric,
         },
     )
+    if args.keep_best_only:
+        cleanup_training_artifacts(output_dir, output_dir / "best_classifier.pt")
     print(f"Classifier training finished. Best checkpoint: {output_dir / 'best_classifier.pt'}")
 
 

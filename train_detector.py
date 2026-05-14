@@ -123,8 +123,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--oom-fallback-batch",
         type=int,
-        default=6,
+        default=0,
         help="Retry once with this batch size when CUDA runs out of memory. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--auto-batch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Auto-detect the largest safe batch size using a memory probe before training.",
+    )
+    parser.add_argument(
+        "--auto-batch-min",
+        type=int,
+        default=1,
+        help="Minimum batch size to try during auto-batch search.",
     )
     return parser
 
@@ -190,6 +202,63 @@ def is_cuda_oom(exc: RuntimeError) -> bool:
     return "cuda" in message and "out of memory" in message
 
 
+def is_cuda_device_arg(device: str) -> bool:
+    normalized = str(device).strip().lower()
+    return torch.cuda.is_available() and normalized not in {"cpu", "mps"}
+
+
+def probe_detector_batch(
+    model_path: str,
+    data_yaml: str,
+    imgsz: int,
+    device: str,
+    target_batch: int,
+    min_batch: int,
+    workers: int,
+) -> int:
+    """Binary search for max safe batch using model.val() as a memory probe.
+
+    Returns a batch size with a 75% safety margin vs the max that fits for val,
+    since training requires more memory for activations + gradients.
+    """
+    from ultralytics import YOLO
+
+    def probe(batch: int) -> bool:
+        try:
+            probe_model = YOLO(model_path)
+            probe_model.val(data=data_yaml, imgsz=imgsz, batch=batch, device=device, workers=0, verbose=False)
+            torch.cuda.empty_cache()
+            return True
+        except RuntimeError as exc:
+            torch.cuda.empty_cache()
+            if "out of memory" in str(exc).lower():
+                return False
+            raise
+
+    if target_batch <= min_batch:
+        return target_batch
+
+    if probe(target_batch):
+        print(f"Auto-batch: target batch {target_batch} fits validation.")
+        safe_batch = max(min_batch, int(target_batch * 0.75))
+        print(f"Auto-batch: using safe batch {safe_batch} for training (75% of val batch).")
+        return safe_batch
+
+    print(f"Auto-batch: target batch {target_batch} OOM during validation probe, searching...")
+    lo, hi = min_batch, target_batch
+    best = min_batch
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if probe(mid):
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    safe_batch = max(min_batch, int(best * 0.75))
+    print(f"Auto-batch: validation fits at batch={best}, using safe batch={safe_batch} for training.")
+    return safe_batch
+
+
 def write_run_summary(save_dir: Path, args: argparse.Namespace, actual_batch: int, duration_seconds: float, val_results) -> None:
     results = getattr(val_results, "results_dict", {}) or {}
     save_json(
@@ -219,6 +288,8 @@ def write_run_summary(save_dir: Path, args: argparse.Namespace, actual_batch: in
             "amp": not args.no_amp,
             "compile": args.compile,
             "seed": args.seed,
+            "auto_batch": args.auto_batch,
+            "auto_batch_min": args.auto_batch_min,
             "duration_seconds": round(duration_seconds, 2),
             "metrics": results,
         },
@@ -234,14 +305,34 @@ def main() -> None:
     started = time.time()
     actual_batch = args.batch
     run_name = args.name
+
+    should_auto_batch = args.auto_batch if args.auto_batch is not None else (
+        args.oom_fallback_batch > 0 and args.oom_fallback_batch < args.batch
+    )
+    if should_auto_batch and is_cuda_device_arg(args.device):
+        detected = probe_detector_batch(
+            model_path=args.model,
+            data_yaml=str(args.data.resolve()),
+            imgsz=args.imgsz,
+            device=args.device,
+            target_batch=args.batch,
+            min_batch=max(1, args.auto_batch_min),
+            workers=args.workers,
+        )
+        actual_batch = detected
+        if detected < args.batch:
+            run_name = f"{args.name}_b{detected}"
+    elif args.oom_fallback_batch > 0 and args.oom_fallback_batch < args.batch:
+        print(f"OOM fallback batch {args.oom_fallback_batch} configured (auto-batch not enabled).")
+
     model = YOLO(args.model)
     try:
         run = model.train(**build_train_kwargs(args, batch=actual_batch, name=run_name))
     except RuntimeError as exc:
-        fallback_batch = args.oom_fallback_batch
-        if not (fallback_batch and fallback_batch < args.batch and is_cuda_oom(exc)):
+        fallback_batch = args.oom_fallback_batch if not should_auto_batch else 0
+        if not (fallback_batch > 0 and fallback_batch < actual_batch and is_cuda_oom(exc)):
             raise
-        print(f"CUDA OOM with batch={args.batch}; retrying once with batch={fallback_batch}.")
+        print(f"CUDA OOM with batch={actual_batch}; retrying once with batch={fallback_batch}.")
         torch.cuda.empty_cache()
         actual_batch = fallback_batch
         run_name = f"{args.name}_b{fallback_batch}"

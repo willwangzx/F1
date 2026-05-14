@@ -17,3 +17,14 @@ classifier:
   num_workers: 4
   early_stop_score: 1.0
   early_stop_patience: 3
+
+  # Training efficiency
+  val_every: 1
+  quick_val_ratio: null
+  val_cache_mode: null
+  grad_accum_steps: 1
+  freeze_backbone: false
+  freeze_backbone_epochs: 0
+  balanced_head: null
+  auto_batch: false
+  auto_batch_min: 1
